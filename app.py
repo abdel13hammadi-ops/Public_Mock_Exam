@@ -9,12 +9,20 @@ from streamlit_autorefresh import st_autorefresh
 from supabase import create_client
 
 
+# Ensure Streamlit Cloud can import project-level utilities from pages/.
+import sys
+from pathlib import Path
+ROOT_DIR = Path(__file__).resolve().parent
+if ROOT_DIR.name == "pages":
+    ROOT_DIR = ROOT_DIR.parent
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from utils.access_control import render_sidebar_navigation, render_locked_premium_previews, fetch_active_certifications, has_premium_access, is_admin_unlocked, get_current_user_email as get_persistent_user_email
 APP_VERSION = "SUPABASE_DB_V12_ENROLLED_CERT_ACCESS"
 CONFIG_FILE = "exam_config.json"
 DEFAULT_EXAM_NAME = "Salesforce Certified Platform Administrator"
 DEFAULT_LANGUAGE_CODE = "en"
-PUBLIC_ACCESS_MODE = True
-PUBLIC_GUEST_EMAIL = "public.guest@example.com"
 
 FALLBACK_CATEGORY_COUNTS = {
     "Configuration and Setup": 9,
@@ -48,6 +56,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+render_sidebar_navigation()
 
 
 def load_config():
@@ -78,14 +87,9 @@ def get_supabase_client():
 
 
 def get_current_user_email():
-    """Return account email; temporary public access returns a guest email when no account is logged in."""
-    email = st.session_state.get("user_email", "") or st.session_state.get("account_email", "")
-    email = str(email).strip().lower()
-    if email and "@" in email and "." in email.split("@")[-1]:
-        return email
-    if PUBLIC_ACCESS_MODE:
-        return PUBLIC_GUEST_EMAIL
-    return None
+    """Return saved/logged-in account email. Restores from encrypted cookie after browser refresh when configured."""
+    return get_persistent_user_email()
+
 
 def get_selected_exam_name():
     return st.session_state.get("selected_exam_name") or config.get("certification") or DEFAULT_EXAM_NAME
@@ -95,16 +99,15 @@ def get_selected_language_code():
     return st.session_state.get("selected_language_code") or DEFAULT_LANGUAGE_CODE
 
 
-PAID_STATUS_VALUES = {"active", "paid", "trialing"}
+PAID_STATUS_VALUES = {"active", "paid", "premium", "subscribed"}  # trialing intentionally excluded
 
 
 def get_user_subscription_status(email):
-    """TEMPORARY PUBLIC ACCESS: every visitor is treated as active."""
-    if PUBLIC_ACCESS_MODE:
-        return "active"
+    """Read subscription_status from app_users for the saved/logged-in email."""
     email = str(email or "").strip().lower()
     if not email:
         return "free"
+
     try:
         supabase = get_supabase_client()
         result = (
@@ -120,6 +123,7 @@ def get_user_subscription_status(email):
         return str(rows[0].get("subscription_status") or "free").strip().lower()
     except Exception:
         return "free"
+
 
 def is_paid_subscription(status):
     return str(status or "").strip().lower() in PAID_STATUS_VALUES
@@ -222,32 +226,25 @@ def fetch_language_label(language_code):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-@st.cache_data(ttl=120, show_spinner=False)
-def fetch_user_certifications(user_email=None):
-    """TEMPORARY PUBLIC ACCESS: return every active certification without enrollment check."""
-    try:
-        result = (
-            get_supabase_client().table("certifications")
-            .select("exam_name, display_name, certification_code, is_active")
-            .eq("is_active", True)
-            .order("display_name")
-            .execute()
-        )
-        return result.data or []
-    except Exception:
-        return []
+def fetch_user_certifications(user_email):
+    """Return certifications visible to this user.
+
+    Free users can select an active certification for the 10-question Free Preview.
+    Paid users/admins get the bundle: all active certifications.
+    """
+    return fetch_active_certifications()
+
 
 def get_user_preferred_language_code(email):
-    """TEMPORARY PUBLIC ACCESS: default all public users to English."""
+    """Use the user profile language everywhere. Do not let exam pages override it."""
     session_lang = str(st.session_state.get("preferred_language_code", "") or "").strip().lower()
     if session_lang:
         return session_lang
-    if PUBLIC_ACCESS_MODE:
-        st.session_state.preferred_language_code = DEFAULT_LANGUAGE_CODE
-        return DEFAULT_LANGUAGE_CODE
+
     email = str(email or "").strip().lower()
     if not email:
         return DEFAULT_LANGUAGE_CODE
+
     try:
         result = (
             get_supabase_client()
@@ -264,7 +261,9 @@ def get_user_preferred_language_code(email):
             return lang
     except Exception:
         pass
+
     return DEFAULT_LANGUAGE_CODE
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_question_bank(exam_name, language_code):
@@ -458,17 +457,26 @@ def generate_paid_exam_questions(bank, category_counts):
 
 
 def generate_free_mock_questions(bank, category_counts):
-    selected = [q for q in bank if q.get("free_mock_exam") is True]
-    required_total = sum(category_counts.values())
+    """Free Preview: exactly 10 fixed sample questions.
 
-    if len(selected) != required_total:
-        st.error(f"Free mock exam setup error: expected {required_total} free questions, found {len(selected)}.")
-        st.info("In Supabase, verify questions.free_mock_exam = true for the selected certification/language.")
+    Preferred source is questions.free_mock_exam = true. If fewer than 10 are tagged,
+    fall back to the first approved questions so the preview does not break during setup.
+    """
+    sample = [q for q in bank if q.get("free_mock_exam") is True]
+    if len(sample) < 10:
+        sample_ids = {q["id"] for q in sample}
+        fallback = [q for q in bank if q["id"] not in sample_ids]
+        fallback.sort(key=lambda q: (q.get("category", ""), q.get("id", 0)))
+        sample.extend(fallback[: 10 - len(sample)])
+
+    if len(sample) < 10:
+        st.error(f"Free Preview setup error: expected 10 sample questions, found {len(sample)}.")
+        st.info("Import more approved questions or tag at least 10 questions with free_mock_exam = true.")
         st.stop()
 
     category_order = list(category_counts.keys())
-    selected.sort(key=lambda q: (category_order.index(q["category"]) if q["category"] in category_order else 999, q["id"]))
-    return selected
+    sample.sort(key=lambda q: (category_order.index(q["category"]) if q["category"] in category_order else 999, q["id"]))
+    return sample[:10]
 
 
 def ensure_exam_generated(exam_access_type, exam_name, language_code, category_counts):
@@ -532,13 +540,17 @@ for key, value in defaults.items():
 
 # Language comes from the user profile. Certification is selected directly on this page.
 user_email_for_language = get_current_user_email()
+if not user_email_for_language:
+    st.warning("Please log in from the Account page before starting an exam.")
+    st.stop()
+
 SELECTED_LANGUAGE_CODE = get_user_preferred_language_code(user_email_for_language)
 LANGUAGE_LABEL = fetch_language_label(SELECTED_LANGUAGE_CODE)
 
 AVAILABLE_CERTIFICATIONS = fetch_user_certifications(user_email_for_language)
 if not AVAILABLE_CERTIFICATIONS:
-    st.error("No active certification enrollment found for this account.")
-    st.info("Ask an admin to enroll this email in a certification, or purchase access when payments are enabled.")
+    st.error("No active certifications found.")
+    st.info("Ask an admin to activate at least one certification in Supabase.")
     st.stop()
 
 CERT_DISPLAY_BY_NAME = {
@@ -589,9 +601,6 @@ DOMAIN_ROWS = exam_setup["domains"]
 
 def get_access_context():
     user_email = get_current_user_email()
-    if PUBLIC_ACCESS_MODE:
-        return user_email, "active", True, "paid"
-
     subscription_status = "free"
     has_paid_access = False
 
@@ -601,6 +610,23 @@ def get_access_context():
 
     exam_access_type = "paid" if has_paid_access else "free"
     return user_email, subscription_status, has_paid_access, exam_access_type
+
+
+user_email, subscription_status, has_paid_access, exam_access_type = get_access_context()
+if is_admin_unlocked():
+    has_paid_access = True
+    exam_access_type = "paid"
+
+# Free Preview is intentionally short. Premium keeps official exam timing.
+if exam_access_type == "free":
+    EXAM_MINUTES = 20
+    EXAM_TITLE = f"{exam_setup['display_name']} Free Preview"
+else:
+    EXAM_TITLE = f"{exam_setup['display_name']} Mock Exam"
+
+all_questions = ensure_exam_generated(exam_access_type, SELECTED_EXAM_NAME, SELECTED_LANGUAGE_CODE, CATEGORY_COUNTS)
+questions = all_questions
+
 
 def get_options(q_index, q):
     if q_index not in st.session_state.choice_orders:
@@ -643,7 +669,7 @@ def save_exam_attempt(score, correct, total_questions, domain_breakdown, difficu
 
     payload = {
         "user_email": user_email,
-        "mode": "Paid Mock Exam" if st.session_state.get("exam_access_type") == "paid" else "Free Mock Exam",
+        "mode": "Paid Mock Exam" if st.session_state.get("exam_access_type") == "paid" else "Free Preview",
         "category": "All Domains",
         "score": float(score),
         "total_questions": int(total_questions),
@@ -681,9 +707,10 @@ st.markdown(
     .question-card { border: 1px solid #d8dde6; border-radius: 8px; padding: 22px; background: #ffffff; margin-top: 12px; margin-bottom: 18px; }
     .status-strip { background: #f8f9fb; border: 1px solid #d8dde6; border-radius: 8px; padding: 12px 16px; margin-bottom: 15px; }
     section[data-testid="stSidebar"] > div:first-child { padding-top: 0.75rem; }
-    .timer-sticky { position: sticky; top: 0; z-index: 999; background: #ffffff; padding-top: 4px; padding-bottom: 14px; border-bottom: 1px solid #d8dde6; margin-bottom: 14px; }
-    .timer-label { font-weight: 700; font-size: 16px; margin-bottom: 7px; color: #1f2937; }
-    .timer-box { background: #fff4d6; border: 1px solid #e0b84f; border-radius: 8px; padding: 12px; text-align: center; font-size: 27px; font-weight: 800; color: #1f2937; letter-spacing: 1px; }
+    .floating-timer { position: fixed !important; top: 74px !important; right: 28px !important; z-index: 999999 !important; width: 178px; background: #ffffff; border: 1px solid #d8dde6; border-radius: 10px; box-shadow: 0 6px 18px rgba(0,0,0,0.18); padding: 8px 10px 10px 10px; }
+    .timer-label { font-weight: 700; font-size: 13px; margin-bottom: 5px; color: #1f2937; text-align: center; }
+    .timer-box { background: #fff4d6; border: 1px solid #e0b84f; border-radius: 8px; padding: 10px; text-align: center; font-size: 29px; font-weight: 850; color: #1f2937; letter-spacing: 1px; line-height: 1.1; }
+    @media (max-width: 800px) { .floating-timer { top: 62px !important; right: 8px !important; width: 132px; padding: 6px 7px 7px 7px; } .timer-label { font-size: 11px; margin-bottom: 4px; } .timer-box { font-size: 22px; padding: 8px; } .exam-banner { padding-right: 150px; } }
     .question-nav-title { font-weight: 700; font-size: 16px; margin-top: 10px; margin-bottom: 8px; color: #1f2937; }
     .small-help { color: #5f6368; font-size: 13px; margin-bottom: 8px; }
     section[data-testid="stSidebar"] div.stButton > button { width: 100%; padding: 0.35rem 0.5rem; font-size: 14px; }
@@ -705,25 +732,23 @@ st.markdown(
 
 if not st.session_state.started:
     st.header("Exam Instructions")
-    st.success(f"Question bank ready ✅ | {'Paid randomized mock exam' if has_paid_access else 'Free fixed sample mock exam'} | {len(all_questions)} questions")
+    st.success(f"Question bank ready ✅ | {'Premium randomized full mock exam' if has_paid_access else 'Free Preview'} | {len(all_questions)} questions")
     st.caption(f"Preferred language: {LANGUAGE_LABEL}")
 
     if user_email:
-        st.success(f"Public access mode ✅ | Session email: {user_email}")
+        st.success(f"Account email: {user_email} ✅")
         if has_paid_access:
-            st.success(f"Subscription status: {subscription_status} ✅ Paid access: randomized full mock exam unlocked")
+            st.success(f"Subscription status: {subscription_status} ✅ Premium unlocked")
         else:
-            st.info("Free access: fixed sample mock exam unlocked. Results and explanations are included at the end.")
-            st.caption("Upgrade later to unlock unlimited randomized mock exams, My Progress, Weak Areas Practice, and the larger question bank.")
-    else:
-        st.warning("Please open the Account page and save/sign in with your email before starting the exam. This is required so your result can be associated with your account.")
-        st.info("After saving your email in Account, return to this page to start the free sample mock exam.")
+            st.info("Free Preview: 10 fixed sample questions, basic score, and full explanations for all 10 sample questions.")
+            st.caption("Premium unlocks full 60-question exams, the full question bank, category practice, weak-area practice, visual progress, and readiness scoring.")
 
     st.markdown(
         """
         <div class="exam-card">
-            <p>Choose the certification above. Your exam language is pulled automatically from your Account profile.</p>
-            <p>Free users get a fixed sample mock exam. Paid users get randomized full mock exams.</p>
+            <p><strong>Free Preview:</strong> 10 fixed sample questions with full explanations after submission.</p>
+            <p><strong>Premium Launch Plan:</strong> $29.99 for 3 months for a limited time. Regular price $49.99.</p>
+            <p><strong>Premium includes:</strong> Salesforce Administrator + Business Analyst, full mock exams, full question bank, Practice by Category, Weak Areas Practice, Visual Progress, and Visual Readiness Score.</p>
             <p>Answers and explanations are hidden until after final submission.</p>
         </div>
         """,
@@ -735,12 +760,19 @@ if not st.session_state.started:
     c2.metric("Time Limit", f"{EXAM_MINUTES} min")
     c3.metric("Passing Score", f"{PASSING_SCORE}%")
 
-    st.subheader("Exam Domain Breakdown")
-    for row in DOMAIN_ROWS:
-        domain = row.get("domain_name")
-        count = int(row.get("question_count") or CATEGORY_COUNTS.get(domain, 0))
-        weight = int(row.get("weight") or CATEGORY_WEIGHTS.get(domain, 0))
-        st.write(f"- **{domain}** — {weight}% / {count} questions")
+    if has_paid_access:
+        st.subheader("Exam Domain Breakdown")
+        for row in DOMAIN_ROWS:
+            domain = row.get("domain_name")
+            count = int(row.get("question_count") or CATEGORY_COUNTS.get(domain, 0))
+            weight = int(row.get("weight") or CATEGORY_WEIGHTS.get(domain, 0))
+            st.write(f"- **{domain}** — {weight}% / {count} questions")
+    else:
+        st.subheader("Free Preview")
+        st.write("- 10 fixed sample questions")
+        st.write("- Basic score after submission")
+        st.write("- Full explanations for all 10 sample questions")
+        st.write("- Premium previews remain locked until upgrade")
 
     st.info(
         """
@@ -750,6 +782,7 @@ if not st.session_state.started:
         - You may mark questions for review and return before submitting.
         - Unanswered questions count as incorrect.
         - Explanations appear only after final submission.
+        - Free Preview results are a sample only and do not represent full exam readiness.
         """
     )
 
@@ -757,7 +790,7 @@ if not st.session_state.started:
 
     col_start, col_regen = st.columns(2)
     with col_start:
-        begin_disabled = False
+        begin_disabled = (user_email is None)
         if st.button("Begin Exam", type="primary", disabled=begin_disabled):
             st.session_state.started = True
             st.session_state.start_time = time.time()
@@ -787,12 +820,18 @@ elif not st.session_state.submitted:
     mins = int(remaining // 60)
     secs = int(remaining % 60)
 
-    st.sidebar.markdown(
+    st.markdown(
         f"""
-        <div class="timer-sticky">
+        <div class="floating-timer">
             <div class="timer-label">Time Remaining</div>
             <div class="timer-box">{mins:02d}:{secs:02d}</div>
         </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.markdown(
+        """
         <div class="question-nav-title">Question Navigator</div>
         <div class="small-help">✓ answered &nbsp;&nbsp; 🚩 marked</div>
         """,
@@ -979,6 +1018,10 @@ else:
             continue
         percent = round((data["correct"] / data["total"]) * 100, 2)
         st.write(f"**{format_diff(difficulty)}:** {data['correct']} / {data['total']} correct ({percent}%)")
+
+    if st.session_state.get("exam_access_type") != "paid":
+        st.divider()
+        render_locked_premium_previews()
 
     st.divider()
     st.header("Answer Review")

@@ -1,0 +1,24 @@
+Timer + persistent login fix
+
+Changed files:
+- app.py
+- pages/Account.py
+- utils/access_control.py
+- access_control.py
+- requirements.txt
+- .streamlit/secrets.toml.example
+
+What changed:
+1. The large exam timer is rendered as a fixed floating timer in the upper-right area of the main page.
+2. The sidebar is used only for navigation/question navigator, not the large timer.
+3. Login can now persist after browser refresh if COOKIE_PASSWORD is set in Streamlit Secrets.
+4. The Account page saves a secure encrypted remember-me cookie after login/signup.
+5. Logout clears both session state and the login cookie.
+
+Add this to Streamlit Secrets:
+COOKIE_PASSWORD = "use-a-long-random-secret-string-here"
+
+Do not put COOKIE_PASSWORD in GitHub code. Put it only in Streamlit Cloud Secrets.
+
+Important:
+If COOKIE_PASSWORD is missing, the app still works, but refresh login persistence is disabled.
